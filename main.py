@@ -15,7 +15,6 @@ class FLAGS(lz.BaseFLAGS):
     problem = ""
     gt_path = ""
     obs_path = ""
-
     depth = 1
     n_train_samples = 0
     n_iters = 1000000
@@ -30,6 +29,16 @@ class FLAGS(lz.BaseFLAGS):
     train_thres = 1.0e-6
 
     hidden_sizes = []
+
+    # additional flags
+    loss_fn = "l1"
+    reg_term_weight = 0.0
+    dataset = ""
+    unobs_path = ""
+    fraction_missing = 0
+    outlier_probabilty = 0
+    cameras = 0
+    project_name = ""
 
     @classmethod
     def finalize(cls):
@@ -147,10 +156,29 @@ class MatrixCompletion(BaseProblem):
     def __init__(self, *, gt_path, obs_path):
         self.w_gt = torch.load(gt_path, map_location=device)
         (self.us, self.vs), self.ys_ = torch.load(obs_path, map_location=device)
+        self.l1_loss = torch.nn.L1Loss()
+        self.unfold = torch.nn.Unfold(kernel_size=3, stride=3)
 
     def get_train_loss(self, e2e):
         self.ys = e2e[self.us, self.vs]
-        return (self.ys - self.ys_).pow(2).mean()
+
+        if FLAGS.loss_fn == "l1":
+            loss = self.l1_loss(self.ys, self.ys_)
+        else:
+            loss = (self.ys - self.ys_).pow(2).mean()
+
+        if FLAGS.reg_term_weight:
+            e2e = e2e.unsqueeze(0).unsqueeze(0).float()
+            original_blocks = self.unfold(e2e)[0]
+            original_blocks = original_blocks.T.reshape([-1, 3, 3])
+            transposed_blocks = original_blocks.permute(1, 2, 0).T
+            prod = torch.matmul(original_blocks, transposed_blocks)
+            diff = prod - torch.eye(3)
+            norm = torch.norm(diff, p=2, dim=(1, 2))
+            reg_term = norm.mean()
+            loss += FLAGS.reg_term_weight * reg_term
+
+        return loss
 
     def get_test_loss(self, e2e):
         return (self.w_gt - e2e).view(-1).pow(2).mean()
