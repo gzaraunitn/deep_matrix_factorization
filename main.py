@@ -7,6 +7,9 @@ import cvxpy as cvx
 import lunzi as lz
 from lunzi.typing import *
 from opt import GroupRMSprop
+import wandb
+from rotmap import *
+import scipy.io
 
 device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
@@ -15,6 +18,7 @@ class FLAGS(lz.BaseFLAGS):
     problem = ""
     gt_path = ""
     obs_path = ""
+    dataset = ""
     depth = 1
     n_train_samples = 0
     n_iters = 1000000
@@ -33,12 +37,15 @@ class FLAGS(lz.BaseFLAGS):
     # additional flags
     loss_fn = "l1"
     reg_term_weight = 0.0
-    dataset = ""
     unobs_path = ""
+    incomp_path = ""
     fraction_missing = 0
     outlier_probabilty = 0
     cameras = 0
     project_name = ""
+    run_name = ""
+    wandb = False
+    synthetic = False
 
     @classmethod
     def finalize(cls):
@@ -153,11 +160,14 @@ class MatrixCompletion(BaseProblem):
     ys: torch.Tensor
 
     @FLAGS.inject
-    def __init__(self, *, gt_path, obs_path):
+    def __init__(self, *, gt_path, obs_path, unobs_path):
         self.w_gt = torch.load(gt_path, map_location=device)
         (self.us, self.vs), self.ys_ = torch.load(obs_path, map_location=device)
         self.l1_loss = torch.nn.L1Loss()
         self.unfold = torch.nn.Unfold(kernel_size=3, stride=3)
+        (self.us_un, self.vs_un), self.ys_un = torch.load(
+            unobs_path, map_location=device
+        )
 
     def get_train_loss(self, e2e):
         self.ys = e2e[self.us, self.vs]
@@ -173,7 +183,7 @@ class MatrixCompletion(BaseProblem):
             original_blocks = original_blocks.T.reshape([-1, 3, 3])
             transposed_blocks = original_blocks.permute(1, 2, 0).T
             prod = torch.matmul(original_blocks, transposed_blocks)
-            diff = prod - torch.eye(3)
+            diff = prod - torch.eye(3).to(device)
             norm = torch.norm(diff, p=2, dim=(1, 2))
             reg_term = norm.mean()
             loss += FLAGS.reg_term_weight * reg_term
@@ -183,9 +193,27 @@ class MatrixCompletion(BaseProblem):
     def get_test_loss(self, e2e):
         return (self.w_gt - e2e).view(-1).pow(2).mean()
 
+    def get_eval_loss(self, e2e, ground_truth, ncams, method="median"):
+        temp = e2e.detach().clone().cpu().numpy()
+        for i in range(0, temp.shape[0], 3):
+            temp[i : i + 3, i : i + 3] = np.eye(3)
+        r = torch.from_numpy(convert_mat(temp, ncams).transpose(2, 0, 1))
+        gt = ground_truth.detach().clone()
+        mean_error, median_error, var_error = compare_rot_graph(r, gt, method=method)
+        return mean_error, median_error, var_error
+
+    def unobserved_loss(self, e2e):
+        pred = e2e.detach().clone()
+        val = pred[self.us_un, self.vs_un]
+        if FLAGS.loss_fn == "l1":
+            loss = self.l1_loss(val.to(device).float(), self.ys_un.float())
+        else:
+            loss = (val.to(device).float() - self.ys_un.float()).pow(2).mean()
+        return loss
+
     @FLAGS.inject
     def get_d_e2e(self, e2e, shape):
-        d_e2e = torch.zeros(shape, device=device)
+        d_e2e = torch.zeros(shape, device=device).type(torch.float64)
         d_e2e[self.us, self.vs] = self.ys - self.ys_
         d_e2e = d_e2e / len(self.ys_)
         return d_e2e
@@ -303,6 +331,9 @@ def main(
     else:
         raise ValueError
 
+    if FLAGS.wandb:
+        wandb.init(project=FLAGS.project_name, name=FLAGS.run_name)
+
     layers = zip(hidden_sizes, hidden_sizes[1:])
     model = nn.Sequential(
         *[nn.Linear(f_in, f_out, bias=False) for (f_in, f_out) in layers]
@@ -323,11 +354,34 @@ def main(
 
     init_model(model)
 
+    r_gt = "R_gt" if FLAGS.synthetic else "R_gt_c"
+    nviews = "nviews" if FLAGS.synthetic else "ncams_c"
+
+    dataset_dir = "datasets_exp3" if FLAGS.synthetic else "datasets_matrices"
+    log_path = _fs.resolve("$LOGDIR")
+    config_path = os.path.join(log_path, "config.toml")
+    print("config path = {}".format(config_path))
+    with open(config_path) as f:
+        lines = f.readlines()
+    dataset = lines[3].strip("\n").split("= ")[1].replace('"', "")
+    ground_truth = torch.from_numpy(
+        scipy.io.loadmat(os.path.join("./MATLAB_SO3/{}/".format(dataset_dir), dataset + ".mat"))[
+            r_gt
+        ].transpose(2, 0, 1)
+    )
+    n_cams = scipy.io.loadmat(
+        os.path.join("./MATLAB_SO3/{}/".format(dataset_dir), dataset + ".mat")
+    )[nviews][0][0]
+    method = "median"
+
     loss = None
     for T in range(n_iters):
         e2e = get_e2e(model)
 
         loss = prob.get_train_loss(e2e)
+
+        if FLAGS.wandb:
+            wandb.log({"train_loss": loss})
 
         params_norm = 0
         for param in model.parameters():
@@ -337,26 +391,23 @@ def main(
 
         with torch.no_grad():
             test_loss = prob.get_test_loss(e2e)
+            unobserved_loss = prob.unobserved_loss(e2e)
+            if FLAGS.wandb:
+                wandb.log({"test_loss": test_loss, "unobserved_loss": unobserved_loss})
 
             if T % FLAGS.n_dev_iters == 0 or loss.item() <= train_thres:
 
-                U, singular_values, V = e2e.svd()  # U D V^T = e2e
-                schatten_norm = singular_values.pow(2.0 / depth).sum()
-
-                d_e2e = prob.get_d_e2e(e2e)
-                full = U.t().mm(d_e2e).mm(V).abs()  # we only need the magnitude.
-                n, m = full.shape
-
-                diag = full.diag()
-                mask = torch.ones_like(full, dtype=torch.int)
-                mask[np.arange(min(n, m)), np.arange(min(n, m))] = 0
-                off_diag = full.masked_select(mask > 0)
-                _writer.add_scalar("diag/mean", diag.mean().item(), global_step=T)
-                _writer.add_scalar("diag/std", diag.std().item(), global_step=T)
-                _writer.add_scalar(
-                    "off_diag/mean", off_diag.mean().item(), global_step=T
+                mean_error, median_error, var_error = prob.get_eval_loss(
+                    e2e, ground_truth, n_cams, method=method
                 )
-                _writer.add_scalar("off_diag/std", off_diag.std().item(), global_step=T)
+                if FLAGS.wandb:
+                    wandb.log(
+                        {
+                            "mean_error": mean_error,
+                            "median_error": median_error,
+                            "var_error": var_error,
+                        }
+                    )
 
                 grads = [
                     param.grad.cpu().data.numpy().reshape(-1)
@@ -370,23 +421,6 @@ def main(
                     adjusted_lr = optimizer.param_groups[0]["adjusted_lr"]
                 else:
                     adjusted_lr = optimizer.param_groups[0]["lr"]
-                _log.info(
-                    f"Iter #{T}: train = {loss.item():.3e}, test = {test_loss.item():.3e}, "
-                    f"Schatten norm = {schatten_norm:.3e}, "
-                    f"grad: {avg_grads_norm:.3e}, "
-                    f"lr = {adjusted_lr:.3f}"
-                )
-
-                _writer.add_scalar("loss/train", loss.item(), global_step=T)
-                _writer.add_scalar("loss/test", test_loss, global_step=T)
-                _writer.add_scalar("Schatten_norm", schatten_norm, global_step=T)
-                _writer.add_scalar("norm/grads", avg_grads_norm, global_step=T)
-                _writer.add_scalar("norm/params", avg_param_norm, global_step=T)
-
-                for i in range(FLAGS.n_singulars_save):
-                    _writer.add_scalar(
-                        f"singular_values/{i}", singular_values[i], global_step=T
-                    )
 
                 torch.save(e2e, _fs.resolve("$LOGDIR/final.npy"))
                 if loss.item() <= train_thres:
