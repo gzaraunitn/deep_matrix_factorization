@@ -30,7 +30,7 @@ class FLAGS(lz.BaseFLAGS):
     optimizer = "GroupRMSprop"
     initialization = "gaussian"  # `orthogonal` or `identity` or `gaussian`
     lr = 0.01
-    train_thres = 1.0e-6
+    train_thres = 1.e-5
 
     hidden_sizes = []
 
@@ -324,10 +324,6 @@ def main(
     prob: BaseProblem
     if problem == "matrix-completion":
         prob = MatrixCompletion()
-    elif problem == "matrix-sensing":
-        prob = MatrixSensing()
-    elif problem == "ml-100k":
-        prob = MovieLens100k()
     else:
         raise ValueError
 
@@ -383,9 +379,9 @@ def main(
         if FLAGS.wandb:
             wandb.log({"train_loss": loss})
 
-        params_norm = 0
-        for param in model.parameters():
-            params_norm = params_norm + param.pow(2).sum()
+        # params_norm = 0
+        # for param in model.parameters():
+        #     params_norm = params_norm + param.pow(2).sum()
         optimizer.zero_grad()
         loss.backward()
 
@@ -414,8 +410,8 @@ def main(
                     for param in model.parameters()
                 ]
                 grads = np.concatenate(grads)
-                avg_grads_norm = np.sqrt(np.mean(grads ** 2))
-                avg_param_norm = np.sqrt(params_norm.item() / len(grads))
+                # avg_grads_norm = np.sqrt(np.mean(grads ** 2))
+                # avg_param_norm = np.sqrt(params_norm.item() / len(grads))
 
                 if isinstance(optimizer, GroupRMSprop):
                     adjusted_lr = optimizer.param_groups[0]["adjusted_lr"]
